@@ -1,0 +1,99 @@
+# The checks the README lists, run on every change.
+#
+# This module needs its own workflow because nothing else runs its tests. The
+# server builds against this repository, so a change that stops compiling fails
+# there — but it runs the server's tests, not these. The codec round-trips, the
+# golden vectors and the fuzz corpus only run here.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: go test (${{ matrix.go }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.26", "stable"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Build and vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Test
+        run: go test -race -shuffle=on -count=1 ./...
+
+      # The floor sits below where both packages are, so it catches a
+      # regression rather than every new line.
+      - name: Coverage
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1
+          total=$(go tool cover -func=coverage.out | tail -1 | grep -oE '[0-9.]+%' | tr -d '%')
+          awk -v t="$total" 'BEGIN { if (t < 95) { printf "coverage %.1f%% is under the 95%% this module holds\n", t; exit 1 } }'
+
+  lint:
+    name: golangci-lint, gofumpt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2 # matches the local toolchain; Renovate bumps it
+
+      - name: gofumpt
+        run: |
+          go install mvdan.cc/gofumpt@v0.12.0
+          test -z "$(gofumpt -l .)" || { gofumpt -l .; exit 1; }
+
+      # -diff fails rather than rewriting, so the module graph a tag builds from
+      # is the one that was reviewed.
+      - name: go mod tidy is a no-op
+        run: go mod tidy -diff
+
+  fuzz:
+    name: fuzz the codec
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+
+      # The decoder reads bytes a driver's machine uploaded, so malformed
+      # input here is somebody else's choice. A short run catches a change
+      # that crashes on the first bad input; it is not a fuzzing campaign.
+      - name: Fuzz
+        run: |
+          go test ./trace -run XXX -fuzz FuzzDecode    -fuzztime 60s
+          go test ./trace -run XXX -fuzz FuzzRoundTrip -fuzztime 60s
